@@ -2,8 +2,8 @@
 
 # ==============================================================
 # USAGE:
-# gpt.ps1 [-s "Системный промпт"] "ваш запрос"
-# gpt.ps1 -h
+# gpt [-s "Системный промпт"] "ваш запрос"
+# gpt -h
 #
 # Если аргументов нет, запрос читается из stdin.
 # ==============================================================
@@ -27,7 +27,7 @@ function Write-ErrorMessage {
 }
 
 function Show-Usage {
-    Write-Output 'Использование: gpt.ps1 [-s "Системный промпт"] "ваш запрос"'
+    Write-Output 'Использование: gpt [-s "Системный промпт"] "ваш запрос"'
     Write-Output '  -s  Кастомный системный промпт.'
     Write-Output '  -h  Показать справку.'
 }
@@ -143,7 +143,7 @@ else {
         $UserPrompt = [Console]::In.ReadToEnd()
     }
     else {
-        Write-Host 'Введите запрос (Ctrl+Z, затем Enter для отправки):'
+        Write-Output 'Введите запрос (Ctrl+Z, затем Enter для отправки):'
         $UserPrompt = [Console]::In.ReadToEnd()
     }
 }
