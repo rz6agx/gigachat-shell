@@ -111,12 +111,12 @@ for ($i = 0; $i -lt $ScriptArgs.Count; $i++) {
     switch ($Arg) {
         '-h' {
             Show-Usage
-            exit 0
+            return
         }
         '-s' {
             if ($i + 1 -ge $ScriptArgs.Count) {
                 Write-ErrorMessage 'Ошибка: после -s требуется системный промпт.'
-                exit 1
+                return
             }
 
             $i++
@@ -126,7 +126,7 @@ for ($i = 0; $i -lt $ScriptArgs.Count; $i++) {
             if ($Arg.StartsWith('-')) {
                 Write-ErrorMessage "Неверный параметр: $Arg"
                 Show-Usage
-                exit 1
+                return
             }
 
             $PromptParts.Add($Arg)
@@ -150,7 +150,7 @@ else {
 
 if ([string]::IsNullOrWhiteSpace($UserPrompt)) {
     Write-ErrorMessage 'Ошибка: пустой запрос.'
-    exit 1
+    return
 }
 
 if ($CustomSystemPrompt) {
@@ -165,7 +165,7 @@ try {
 }
 catch {
     Write-ErrorMessage "Ошибка: $($_.Exception.Message)"
-    exit 1
+    return
 }
 
 $Payload = @{
@@ -202,7 +202,7 @@ catch {
         $Details = $_.Exception.Message
     }
     Write-ErrorMessage "Ошибка: не удалось выполнить запрос к API GigaChat: $Details"
-    exit 1
+    return
 }
 
 $AIText = $Response.choices[0].message.content
@@ -222,7 +222,7 @@ if ($null -eq $AIText) {
         $Details = $Response | ConvertTo-Json -Compress -Depth 10
         Write-ErrorMessage "Ошибка API GigaChat: неизвестный формат ответа. $Details"
     }
-    exit 1
+    return
 }
 
 [Console]::Out.WriteLine([string]$AIText)
