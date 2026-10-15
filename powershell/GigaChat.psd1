@@ -5,7 +5,6 @@
     Author            = 'rz6agx'
     Description       = 'Консольный помощник на базе API GigaChat'
     PowerShellVersion = '7.0'
-
     FunctionsToExport = @('gpt')
     CmdletsToExport   = @()
     VariablesToExport = @()
