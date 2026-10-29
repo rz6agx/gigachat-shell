@@ -29,7 +29,7 @@ if [ -z "$GIGACHAT_CREDENTIALS" ]; then
 fi
 
 BASE_URL="https://api.giga.chat"
-TOKEN_CACHE="/tmp/.gigachat_token"
+TOKEN_CACHE="$HOME/.local/gigachat_token"
 TOKEN_TTL=1500
 
 # Функция получения и кэширования токена
@@ -54,7 +54,7 @@ get_access_token() {
         return 1
     }
 
-    local response_file="/tmp/gigachat_oauth_resp.json"
+    local response_file="$HOME/.local/gigachat_oauth_resp.json"
 
     if ! curl -sS -X POST 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth' \
         -H 'Content-Type: application/x-www-form-urlencoded' \
@@ -122,7 +122,7 @@ fi
 if [ -n "$CUSTOM_SYSTEM_PROMPT" ]; then
     SYSTEM_CONTEXT="$CUSTOM_SYSTEM_PROMPT"
 else
-    SYSTEM_CONTEXT="Ты — полезный ИИ-ассистент, встроенный в Терминал MacOS. Отвечай кратко."
+    SYSTEM_CONTEXT="Ты — полезный ИИ-ассистент, встроенный в терминал. Отвечай кратко."
 fi
 
 ACCESS_TOKEN=$(get_access_token)
