@@ -39,6 +39,19 @@ function Show-Usage {
     Write-Output '  -h  Показать справку.'
 }
 
+function Get-ResponseError {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    if ($ErrorRecord.ErrorDetails.Message) {
+        return $ErrorRecord.ErrorDetails.Message
+    }
+
+    return $ErrorRecord.Exception.Message
+}
+
 function Get-AccessToken {
     if (Test-Path -LiteralPath $script:TokenCache -PathType Leaf) {
         try {
@@ -74,12 +87,7 @@ function Get-AccessToken {
             -Body 'scope=GIGACHAT_API_PERS'
     }
     catch {
-        $Details = $_.ErrorDetails.Message
-        if (-not $Details) {
-            $Details = $_.Exception.Message
-        }
-
-        throw "Не удалось получить OAuth-токен: $Details"
+        throw "Не удалось получить OAuth-токен: $(Get-ResponseError $_ )"
     }
 
     $NewToken = $TokenResponse.access_token
@@ -115,54 +123,26 @@ function Trim-GigaChatHistory {
 }
 
 function gpt {
+    [CmdletBinding(PositionalBinding = $false)]
+    param(
+        [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+        [string[]]$Prompt,
+        [string]$s,
+        [switch]$m,
+        [switch]$h
+)
+
     $ErrorActionPreference = 'Stop'
 
-    # Разбор аргументов
-    $ScriptArgs = @($args)
-    $CustomSystemPrompt = $null
-    $UseMemory = $false
-    $PromptParts = [System.Collections.Generic.List[string]]::new()
-
-    for ($i = 0; $i -lt $ScriptArgs.Count; $i++) {
-        $Arg = [string]$ScriptArgs[$i]
-
-        switch ($Arg) {
-            '-h' {
-                Show-Usage
-                return
-            }
-
-            '-s' {
-                if ($i + 1 -ge $ScriptArgs.Count) {
-                    Write-ErrorMessage 'Ошибка: после -s требуется системный промпт.'
-                    return
-                }
-
-                $i++
-                $CustomSystemPrompt = [string]$ScriptArgs[$i]
-            }
-
-            '-m' {
-                $UseMemory = $true
-            }
-
-            default {
-                if ($Arg.StartsWith('-')) {
-                    Write-ErrorMessage "Неверный параметр: $Arg"
-                    Show-Usage
-                    return
-                }
-
-                $PromptParts.Add($Arg)
-            }
-        }
+    if ($h) {
+        Show-Usage
+        return
     }
+
+    $UserPrompt = $Prompt -join ' '
 
     # Получение запроса из аргументов или stdin
-    if ($PromptParts.Count -gt 0) {
-        $UserPrompt = $PromptParts -join ' '
-    }
-    else {
+    if ([string]::IsNullOrWhiteSpace($UserPrompt)) {
         if (-not [Console]::IsInputRedirected) {
             Write-Output 'Введите запрос (Ctrl+Z, затем Enter для отправки):'
         }
@@ -176,15 +156,15 @@ function gpt {
     }
 
     # Системный промпт текущего запроса
-    if ($null -ne $CustomSystemPrompt) {
-        $SystemContext = $CustomSystemPrompt
+    if ($null -ne $s) {
+        $SystemContext = $s
     }
     else {
         $SystemContext = $script:DefaultSystemPrompt
     }
 
     # Без -m начинаем новый диалог
-    if (-not $UseMemory) {
+    if (-not $m) {
         $script:GigaChatHistory.Clear()
     }
 
@@ -215,12 +195,10 @@ function gpt {
     })
 
     $Payload = @{
-        model    = 'GigaChat-2-Pro'
+        model    = 'GigaChat-2-Max'
         messages = $Messages
         stream   = $false
     }
-
-    $JsonPayload = $Payload | ConvertTo-Json -Depth 10 -Compress
 
     # Запрос к API
     try {
@@ -232,20 +210,19 @@ function gpt {
                 Authorization = "Bearer $AccessToken"
             } `
             -ContentType 'application/json; charset=utf-8' `
-            -Body ([System.Text.Encoding]::UTF8.GetBytes($JsonPayload))
+            -Body ($Payload | ConvertTo-Json -Depth 10 -Compress)
     }
     catch {
-        $Details = $_.ErrorDetails.Message
-        if (-not $Details) {
-            $Details = $_.Exception.Message
-        }
-
-        Write-ErrorMessage "Ошибка: не удалось выполнить запрос к API GigaChat: $Details"
+        Write-ErrorMessage "Ошибка: не удалось выполнить запрос к API GigaChat: $(Get-ResponseError $_)"
         return
     }
 
     # Проверка ответа
-    $AIText = $Response.choices[0].message.content
+    $AIText = $null
+
+    if ($Response.choices -and $Response.choices[0] -and $null -ne $Response.choices[0].message.content) {
+        $AIText = $Response.choices[0].message.content
+    }
 
     if ($null -eq $AIText) {
         if ($Response.error) {
