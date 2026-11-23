@@ -98,7 +98,7 @@ gpt -s "Ты опытный Windows администратор. Отвечай �
 gpt -s "Проанализируй код модуля на ошибки" (Get-Content "$HOME\Documents\PowerShell\Modules\GigaChat\GigaChat.psm1" -Raw)
 
 # Анализ файла с GitHub
-gpt -s "Проанализируй код модуля на ошибки" (Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/rz6agx/gigachat-shell/refs/heads/main/powershell/GigaChat.psm1')
+gpt -s "Проанализируй код модуля на ошибки" (Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/rz6agx/gigachat-shell/refs/heads/main/powershell/GigaChat.psm1' -Raw)
 
 # Начало диалога
 gpt "Что делает Get-ChildItem?"
