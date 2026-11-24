@@ -91,6 +91,9 @@ prune_history() {
 
     for file in "$HIST_DIR"/gigachat_history_*; do
         [ -e "$file" ] || [ -L "$file" ] || continue
+        # Чужие файлы в общем /tmp не трогаем: rm всё равно упрётся в EPERM,
+        # а kill -0 на чужой процесс вернёт ошибку доступа.
+        [ -O "$file" ] || continue
         pid=${file##*_}
 
         case "$pid" in
