@@ -195,7 +195,7 @@ function gpt {
     })
 
     $Payload = @{
-        model    = 'GigaChat-2-Max'
+        model    = 'GigaChat-2-Pro'
         messages = $Messages
         stream   = $false
     }

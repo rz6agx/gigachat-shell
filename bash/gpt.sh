@@ -10,8 +10,8 @@ trap 'echo -e "\nВвод прерван."; exit 130' INT
 #
 #   -s  Использовать кастомный системный промпт вместо стандартного.
 #       Пример: gpt -s "Ты — Senior Python Developer" "Напиши код"
-#   -m  Продолжить предыдущий диалог (до 10 пар вопрос-ответ).
-#       Без -m история диалога очищается.
+#   -m  Продолжить диалог текущей сессии оболочки (до 10 пар вопрос-ответ).
+#       Без -m история начинается заново.
 #   -h  Показать справку.
 #
 # Запрос можно передать через stdin:
@@ -19,9 +19,12 @@ trap 'echo -e "\nВвод прерван."; exit 130' INT
 # Если запрос передан и аргументом, и через stdin, содержимое stdin
 # добавляется к запросу отдельным блоком.
 #
+# Ответ печатается по мере генерации. История -m живёт в рамках сессии
+# оболочки и удаляется автоматически, отдельного файла в ~/.local нет.
+#
 # Настройки через переменные окружения:
 #   GIGACHAT_CREDENTIALS  ключ авторизации (обязательно)
-#   GIGACHAT_MODEL        модель (по умолчанию GigaChat-2-Max)
+#   GIGACHAT_MODEL        модель (по умолчанию GigaChat-2-Pro)
 #   GIGACHAT_TIMEOUT      таймаут запроса в секундах (по умолчанию 120)
 #   GIGACHAT_BASE_URL     адрес API (по умолчанию https://api.giga.chat)
 # ==============================================================
@@ -35,7 +38,7 @@ umask 077
 
 BASE_URL="${GIGACHAT_BASE_URL:-https://api.giga.chat}"
 OAUTH_URL="https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-MODEL="${GIGACHAT_MODEL:-GigaChat-2-Max}"
+MODEL="${GIGACHAT_MODEL:-GigaChat-2-Pro}"
 HTTP_TIMEOUT="${GIGACHAT_TIMEOUT:-120}"
 
 TOKEN_TTL=1500
@@ -43,7 +46,15 @@ MAX_HISTORY_PAIRS=10
 
 CACHE_DIR="$HOME/.local"
 TOKEN_CACHE="$CACHE_DIR/gigachat_token"
-HISTORY_FILE="$CACHE_DIR/gigachat_history.json"
+
+# История привязана к родительской оболочке: $PPID одинаков у всех вызовов
+# из одной сессии, а файлы в TMPDIR не переживают перезагрузку.
+HIST_DIR="${TMPDIR:-/tmp}"
+HIST_DIR="${HIST_DIR%/}"
+HISTORY_FILE="$HIST_DIR/gigachat_history_$PPID"
+
+# Разбор потока SSE: data: {...} -> текст дельты.
+SSE_FILTER='select(startswith("data: ")) | ltrimstr("data: ") | fromjson? | .choices[0].delta.content? // empty'
 
 # Временные файлы (в них лежат токен и тело запроса) удаляются при выходе.
 TMP_FILES=()
@@ -69,14 +80,32 @@ curl_escape() {
 print_usage() {
     echo "Использование: $0 [-s \"Системный промпт\"] [-m] \"ваш запрос\""
     echo "  -s  Кастомный системный промпт."
-    echo "  -m  Продолжить предыдущий диалог."
+    echo "  -m  Продолжить диалог текущей сессии."
     echo "  -h  Показать справку."
     exit "$1"
 }
 
+# Удаляем историю завершённых сессий: файл брошен, если его оболочки уже нет.
+prune_history() {
+    local file pid
+
+    for file in "$HIST_DIR"/gigachat_history_*; do
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        pid=${file##*_}
+
+        case "$pid" in
+            '' | *[!0-9]*) rm -f "$file"; continue ;;
+        esac
+
+        [ "$pid" = "$PPID" ] && continue
+        kill -0 "$pid" 2>/dev/null || rm -f "$file"
+    done
+}
+
 # Печатает историю диалога как JSON-массив сообщений.
+# Симлинк или чужой файл игнорируются: имя в TMPDIR предсказуемо.
 load_history() {
-    if [ -f "$HISTORY_FILE" ]; then
+    if [ -f "$HISTORY_FILE" ] && [ ! -L "$HISTORY_FILE" ] && [ -O "$HISTORY_FILE" ]; then
         jq -c 'if type == "array" then . else [] end' "$HISTORY_FILE" 2>/dev/null && return 0
     fi
     printf '[]\n'
@@ -86,7 +115,7 @@ load_history() {
 save_history() {
     local history=$1 user=$2 assistant=$3 tmp out
 
-    tmp=$(mktemp "$CACHE_DIR/.gigachat_history.XXXXXX" 2>/dev/null) || return 0
+    tmp=$(mktemp "$HIST_DIR/.gigachat_history_${PPID}.XXXXXX" 2>/dev/null) || return 0
     TMP_FILES+=("$tmp")
 
     if out=$(printf '%s' "$history" | jq -c \
@@ -167,9 +196,10 @@ get_access_token() {
     printf '%s\n' "$new_token"
 }
 
-# Возвращает HTTP-код ответа, тело пишет в третий аргумент.
-chat_request() {
-    local token=$1 payload_file=$2 out_file=$3 cfg http
+# Потоковый запрос: текст печатается по мере генерации, полный ответ
+# сохраняется в $OUT_FILE (для истории), сырой поток — в $RAW_FILE.
+stream_chat() {
+    local token=$1 cfg curl_rc
 
     cfg=$(make_tmp) || return 1
 
@@ -179,14 +209,28 @@ chat_request() {
         printf 'header = "Authorization: Bearer %s"\n' "$(curl_escape "$token")"
     } > "$cfg"
 
-    http=$(curl -sS --connect-timeout 10 --max-time "$HTTP_TIMEOUT" -X POST \
+    : > "$OUT_FILE"
+    : > "$RAW_FILE"
+
+    curl -sS -N --connect-timeout 10 --max-time "$HTTP_TIMEOUT" -X POST \
         -K "$cfg" \
         -H 'Content-Type: application/json; charset=utf-8' \
-        --data-binary "@$payload_file" \
-        -o "$out_file" -w '%{http_code}') || return 1
+        -D "$HDR_FILE" \
+        --data-binary "@$PAYLOAD_FILE" |
+        tee "$RAW_FILE" |
+        jq --unbuffered -Rj "$SSE_FILTER" |
+        tee "$OUT_FILE"
 
-    printf '%s\n' "$http"
+    curl_rc=${PIPESTATUS[0]}
+    return "$curl_rc"
 }
+
+# Код ответа: первая строка дампа заголовков.
+response_code() {
+    awk 'NR == 1 { print $2; exit }' "$HDR_FILE" 2>/dev/null
+}
+
+prune_history
 
 # ==============================================================
 # Разбор аргументов
@@ -246,6 +290,8 @@ if ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
     exit 1
 fi
 
+prune_history
+
 # ==============================================================
 # Запрос
 # ==============================================================
@@ -270,23 +316,27 @@ JSON_PAYLOAD=$(jq -n \
         model: $model,
         messages: ([{role: "system", content: $sys_content}] + $history +
                    [{role: "user", content: $user_content}]),
-        stream: false
+        stream: true
     }')
+
+PAYLOAD_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
+printf '%s' "$JSON_PAYLOAD" > "$PAYLOAD_FILE"
+
+OUT_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
+RAW_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
+HDR_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
 
 ACCESS_TOKEN=$(get_access_token) || exit 1
 if [ -z "$ACCESS_TOKEN" ]; then
     exit 1
 fi
 
-PAYLOAD_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
-printf '%s' "$JSON_PAYLOAD" > "$PAYLOAD_FILE"
-
-RESPONSE_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
-
-if ! HTTP_CODE=$(chat_request "$ACCESS_TOKEN" "$PAYLOAD_FILE" "$RESPONSE_FILE"); then
+if ! stream_chat "$ACCESS_TOKEN"; then
     echo "Ошибка: не удалось подключиться к API GigaChat." >&2
     exit 1
 fi
+
+HTTP_CODE=$(response_code)
 
 # Токен мог быть отозван или протухнуть раньше срока — обновляем и повторяем один раз.
 if [ "$HTTP_CODE" = "401" ]; then
@@ -296,42 +346,38 @@ if [ "$HTTP_CODE" = "401" ]; then
     if [ -z "$ACCESS_TOKEN" ]; then
         exit 1
     fi
-    if ! HTTP_CODE=$(chat_request "$ACCESS_TOKEN" "$PAYLOAD_FILE" "$RESPONSE_FILE"); then
+    if ! stream_chat "$ACCESS_TOKEN"; then
         echo "Ошибка: не удалось подключиться к API GigaChat." >&2
         exit 1
     fi
+    HTTP_CODE=$(response_code)
 fi
 
-RESPONSE=$(cat "$RESPONSE_FILE")
+AI_TEXT=""
 
-# Проверяем, что ответ является корректным JSON
-if ! printf '%s' "$RESPONSE" | jq -e . >/dev/null 2>&1; then
-    echo "Ошибка: сервер вернул некорректный JSON (HTTP ${HTTP_CODE:-?})." >&2
-    printf '%s\n' "$RESPONSE" >&2
-    exit 1
-fi
-
-# Проверяем ошибки API
-if ! AI_TEXT=$(printf '%s' "$RESPONSE" | jq -er '
-    if .choices[0].message.content? then
-        .choices[0].message.content
-    elif .error then
-        error(.error.message // (.error | tostring))
-    elif .message then
-        error(.message)
-    else
-        error("Неизвестный формат ответа API")
-    end
-'); then
-    echo "Ошибка API GigaChat." >&2
-    exit 1
+if [ -s "$OUT_FILE" ]; then
+    AI_TEXT=$(cat "$OUT_FILE")
+    # Стриминг печатает без завершающего перевода строки.
+    printf '\n'
+elif [ "$HTTP_CODE" = "200" ]; then
+    # Поток не распознан (прокси мог отключить SSE) — пробуем цельный JSON-ответ.
+    AI_TEXT=$(jq -r '.choices[0].message.content // empty' "$RAW_FILE" 2>/dev/null)
+    if [ -n "$AI_TEXT" ]; then
+        printf '%s\n' "$AI_TEXT"
+    fi
 fi
 
 if [ -z "$AI_TEXT" ]; then
-    echo "Ошибка API GigaChat: модель вернула пустой ответ." >&2
+    API_ERROR=$(jq -r '.error.message // .message // empty' "$RAW_FILE" 2>/dev/null)
+
+    if [ -n "$API_ERROR" ]; then
+        echo "Ошибка API GigaChat: $API_ERROR" >&2
+    else
+        echo "Ошибка API GigaChat: пустой ответ (HTTP ${HTTP_CODE:-?})." >&2
+        head -c 500 "$RAW_FILE" >&2 2>/dev/null
+        echo >&2
+    fi
     exit 1
 fi
-
-printf '%s\n' "$AI_TEXT"
 
 save_history "$HISTORY_JSON" "$USER_PROMPT" "$AI_TEXT"
