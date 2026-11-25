@@ -20,8 +20,8 @@ trap 'echo -e "\nВвод прерван."; exit 130' INT
 # добавляется к запросу отдельным блоком.
 #
 # Ответ печатается по мере генерации. История -m живёт в рамках сессии
-# оболочки (~/.local/gigachat_history_<pid>) и удаляется автоматически,
-# когда сессия завершилась.
+# оболочки (~/.local/gigachat_history_<pid>). Файлы завершённых сессий
+# удаляются при следующем запуске gpt.
 #
 # Настройки через переменные окружения:
 #   GIGACHAT_CREDENTIALS  ключ авторизации (обязательно)
@@ -56,19 +56,23 @@ HISTORY_FILE="$HIST_DIR/gigachat_history_$PPID"
 # Разбор потока SSE: data: {...} -> текст дельты.
 SSE_FILTER='select(startswith("data: ")) | ltrimstr("data: ") | fromjson? | .choices[0].delta.content? // empty'
 
-# Временные файлы (в них лежат токен и тело запроса) удаляются при выходе.
+# Временные файлы запуска (конфиги curl, тело запроса, ответ, заголовки)
+# лежат в отдельном каталоге и удаляются при любом выходе.
+TMP_DIR=""
+# Временные файлы для атомарной замены кэша/истории лежат рядом с ними.
 TMP_FILES=()
 
 cleanup() {
     [ ${#TMP_FILES[@]} -eq 0 ] || rm -f "${TMP_FILES[@]}"
+    [ -z "$TMP_DIR" ] || rm -rf "$TMP_DIR"
     return 0
 }
 trap cleanup EXIT
 
 make_tmp() {
     local file
-    file=$(mktemp) || return 1
-    TMP_FILES+=("$file")
+    [ -n "$TMP_DIR" ] || return 1
+    file=$(mktemp "$TMP_DIR/tmp.XXXXXX") || return 1
     printf '%s\n' "$file"
 }
 
@@ -85,20 +89,24 @@ print_usage() {
     exit "$1"
 }
 
-# Удаляем историю завершённых сессий: файл брошен, если его оболочки уже нет.
+# Удаляем историю завершённых сессий при следующем запуске:
+# файл брошен, если его оболочки уже нет.
 prune_history() {
     local file pid
 
     [ -d "$HIST_DIR" ] || return 0
 
     for file in "$HIST_DIR"/gigachat_history_*; do
-        [ -e "$file" ] || [ -L "$file" ] || continue
-        # На случай файла, созданного под другим пользователем (например, sudo).
+        # Только обычные файлы, не симлинки и не чужие файлы.
+        [ -f "$file" ] || continue
+        [ -L "$file" ] && continue
         [ -O "$file" ] || continue
         pid=${file##*_}
 
+        # Ожидаемое имя: gigachat_history_<число>. Нечисловые суффиксы
+        # могут принадлежать пользовательским файлам — их не трогаем.
         case "$pid" in
-            '' | *[!0-9]*) rm -f "$file"; continue ;;
+            '' | *[!0-9]*) continue ;;
         esac
 
         [ "$pid" = "$PPID" ] && continue
@@ -107,7 +115,7 @@ prune_history() {
 }
 
 # Печатает историю диалога как JSON-массив сообщений.
-# Симлинк или чужой файл игнорируются: имя в TMPDIR предсказуемо.
+# Симлинк или чужой файл игнорируются: имя в ~/.local предсказуемо.
 load_history() {
     if [ -f "$HISTORY_FILE" ] && [ ! -L "$HISTORY_FILE" ] && [ -O "$HISTORY_FILE" ]; then
         jq -c 'if type == "array" then . else [] end' "$HISTORY_FILE" 2>/dev/null && return 0
@@ -116,21 +124,55 @@ load_history() {
 }
 
 # История перезаписывается целиком: контекст отправленного запроса + новый обмен.
+# Большие вопрос и ответ передаются в jq через файлы (--rawfile), а не аргументами.
 save_history() {
-    local history=$1 user=$2 assistant=$3 tmp out
+    local history=$1 user=$2 assistant=$3
+    local tmp err_tmp user_tmp assistant_tmp
 
-    tmp=$(mktemp "$HIST_DIR/.gigachat_history_${PPID}.XXXXXX" 2>/dev/null) || return 0
+    tmp=$(mktemp "$HIST_DIR/.gigachat_history_${PPID}.XXXXXX" 2>/dev/null) || {
+        echo "Предупреждение: не удалось создать временный файл истории." >&2
+        return 1
+    }
     TMP_FILES+=("$tmp")
 
-    if out=$(printf '%s' "$history" | jq -c \
-        --arg u "$user" \
-        --arg a "$assistant" \
+    user_tmp=$(make_tmp) || {
+        echo "Предупреждение: не удалось создать временный файл истории." >&2
+        return 1
+    }
+    assistant_tmp=$(make_tmp) || {
+        echo "Предупреждение: не удалось создать временный файл истории." >&2
+        return 1
+    }
+    err_tmp=$(make_tmp) || err_tmp=/dev/null
+
+    if ! printf '%s' "$user" > "$user_tmp"; then
+        echo "Предупреждение: не удалось сохранить историю диалога." >&2
+        return 1
+    fi
+    if ! printf '%s' "$assistant" > "$assistant_tmp"; then
+        echo "Предупреждение: не удалось сохранить историю диалога." >&2
+        return 1
+    fi
+
+    if printf '%s' "$history" | jq -c \
+        --rawfile u "$user_tmp" \
+        --rawfile a "$assistant_tmp" \
         --argjson max "$MAX_HISTORY_PAIRS" '
             (. + [{role: "user", content: $u}, {role: "assistant", content: $a}]) as $all
             | $all[([0, ($all | length) - (2 * $max)] | max):]
-        ' 2>/dev/null); then
-        printf '%s\n' "$out" > "$tmp" && mv -f "$tmp" "$HISTORY_FILE"
+        ' > "$tmp" 2> "$err_tmp"; then
+        if mv -f "$tmp" "$HISTORY_FILE"; then
+            return 0
+        fi
+        echo "Предупреждение: не удалось обновить файл истории." >&2
+        return 1
     fi
+
+    echo "Предупреждение: не удалось сохранить историю диалога." >&2
+    if [ -s "$err_tmp" ]; then
+        sed 's/^/  /' "$err_tmp" >&2
+    fi
+    return 1
 }
 
 get_access_token() {
@@ -229,9 +271,10 @@ stream_chat() {
     return "$curl_rc"
 }
 
-# Код ответа: первая строка дампа заголовков.
+# Код последнего HTTP-ответа из дампа заголовков: при HTTPS CONNECT
+# и промежуточных 1xx в файле может быть несколько блоков.
 response_code() {
-    awk 'NR == 1 { print $2; exit }' "$HDR_FILE" 2>/dev/null
+    awk '/^HTTP\// { code=$2 } END { if (code != "") print code }' "$HDR_FILE" 2>/dev/null
 }
 
 prune_history
@@ -296,6 +339,13 @@ fi
 
 prune_history
 
+# Отдельный каталог запуска: конфиги curl с Authorization, тело запроса,
+# ответ и заголовки удаляются на EXIT (включая ошибки и Ctrl+C).
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gigachat.XXXXXX") || {
+    echo "Ошибка: не удалось создать временный каталог." >&2
+    exit 1
+}
+
 # ==============================================================
 # Запрос
 # ==============================================================
@@ -311,20 +361,32 @@ else
     HISTORY_JSON='[]'
 fi
 
-JSON_PAYLOAD=$(jq -n \
-    --arg model "$MODEL" \
-    --arg sys_content "$SYSTEM_CONTEXT" \
-    --arg user_content "$USER_PROMPT" \
-    --argjson history "$HISTORY_JSON" \
-    '{
-        model: $model,
-        messages: ([{role: "system", content: $sys_content}] + $history +
-                   [{role: "user", content: $user_content}]),
-        stream: true
-    }')
+# Большие данные передаём в jq через файлы: аргументы командной строки
+# ограничены ARG_MAX (в Linux — около 128 КиБ на аргумент).
+SYSTEM_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
+PROMPT_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
+HISTORY_TMP=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
+
+printf '%s' "$SYSTEM_CONTEXT" > "$SYSTEM_FILE"
+printf '%s' "$USER_PROMPT" > "$PROMPT_FILE"
+printf '%s' "$HISTORY_JSON" > "$HISTORY_TMP"
 
 PAYLOAD_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
-printf '%s' "$JSON_PAYLOAD" > "$PAYLOAD_FILE"
+
+if ! jq -n \
+    --arg model "$MODEL" \
+    --rawfile sys_content "$SYSTEM_FILE" \
+    --rawfile user_content "$PROMPT_FILE" \
+    --slurpfile history "$HISTORY_TMP" \
+    '{
+        model: $model,
+        messages: ([{role: "system", content: $sys_content}] + $history[0] +
+                   [{role: "user", content: $user_content}]),
+        stream: true
+    }' > "$PAYLOAD_FILE"; then
+    echo "Ошибка: не удалось сформировать JSON-запрос (jq)." >&2
+    exit 1
+fi
 
 OUT_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
 RAW_FILE=$(make_tmp) || { echo "Ошибка: нет доступного временного файла." >&2; exit 1; }
@@ -384,4 +446,6 @@ if [ -z "$AI_TEXT" ]; then
     exit 1
 fi
 
+# История — часть результата: при ошибке save_history выводит предупреждение,
+# а ненулевой код возврата сигнализирует, что следующий -m не увидит этот обмен.
 save_history "$HISTORY_JSON" "$USER_PROMPT" "$AI_TEXT"
