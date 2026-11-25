@@ -127,140 +127,172 @@ function gpt {
     param(
         [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
         [string[]]$Prompt,
+        [Parameter(ValueFromPipeline = $true)]
+        [string]$InputObject,
         [string]$s,
         [switch]$m,
         [switch]$h
-)
+    )
 
-    $ErrorActionPreference = 'Stop'
+    begin {
+        $ErrorActionPreference = 'Stop'
 
-    if ($h) {
-        Show-Usage
-        return
+        # Признак реального Pipeline: вызов без него тоже однократно запускает process.
+        $HasPipelineInput = $PSCmdlet.MyInvocation.ExpectingInput
+        $PipelineLines = [System.Collections.Generic.List[string]]::new()
     }
 
-    $UserPrompt = $Prompt -join ' '
+    process {
+        if ($HasPipelineInput) {
+            $PipelineLines.Add([string]$InputObject)
+        }
+    }
 
-    # Получение запроса из аргументов или stdin
-    if ([string]::IsNullOrWhiteSpace($UserPrompt)) {
-        if (-not [Console]::IsInputRedirected) {
-            Write-Output 'Введите запрос (Ctrl+Z, затем Enter для отправки):'
+    end {
+        if ($h) {
+            Show-Usage
+            return
         }
 
-        $UserPrompt = [Console]::In.ReadToEnd()
-    }
+        $Instruction = $Prompt -join ' '
+        $HasInstruction = -not [string]::IsNullOrWhiteSpace($Instruction)
+        $HasPipeline = $PipelineLines.Count -gt 0
 
-    if ([string]::IsNullOrWhiteSpace($UserPrompt)) {
-        Write-ErrorMessage 'Ошибка: пустой запрос.'
-        return
-    }
-
-    # Системный промпт текущего запроса
-    if ($null -ne $s) {
-        $SystemContext = $s
-    }
-    else {
-        $SystemContext = $script:DefaultSystemPrompt
-    }
-
-    # Без -m начинаем новый диалог
-    if (-not $m) {
-        $script:GigaChatHistory.Clear()
-    }
-
-    # Получение токена
-    try {
-        $AccessToken = Get-AccessToken
-    }
-    catch {
-        Write-ErrorMessage "Ошибка: $($_.Exception.Message)"
-        return
-    }
-
-    # Сборка контекста
-    $Messages = [System.Collections.Generic.List[hashtable]]::new()
-
-    $Messages.Add(@{
-        role    = 'system'
-        content = $SystemContext
-    })
-
-    foreach ($Message in $script:GigaChatHistory) {
-        $Messages.Add($Message)
-    }
-
-    $Messages.Add(@{
-        role    = 'user'
-        content = $UserPrompt
-    })
-
-    $Payload = @{
-        model    = 'GigaChat-2-Pro'
-        messages = $Messages
-        stream   = $false
-    }
-
-    # Запрос к API
-    try {
-        $Response = Invoke-RestMethod `
-            -Uri "$script:BaseUrl/v1/chat/completions" `
-            -Method Post `
-            -Headers @{
-                Accept        = 'application/json'
-                Authorization = "Bearer $AccessToken"
-            } `
-            -ContentType 'application/json; charset=utf-8' `
-            -Body ($Payload | ConvertTo-Json -Depth 10 -Compress)
-    }
-    catch {
-        Write-ErrorMessage "Ошибка: не удалось выполнить запрос к API GigaChat: $(Get-ResponseError $_)"
-        return
-    }
-
-    # Проверка ответа
-    $AIText = $null
-
-    if ($Response.choices -and $Response.choices[0] -and $null -ne $Response.choices[0].message.content) {
-        $AIText = $Response.choices[0].message.content
-    }
-
-    if ($null -eq $AIText) {
-        if ($Response.error) {
-            $ApiError = $Response.error.message
-
-            if (-not $ApiError) {
-                $ApiError = $Response.error | ConvertTo-Json -Compress -Depth 10
-            }
-
-            Write-ErrorMessage "Ошибка API GigaChat: $ApiError"
+        # Инструкция из аргумента предшествует содержимому Pipeline.
+        if ($HasInstruction -and $HasPipeline) {
+            $UserPrompt = $Instruction + "`n" + ($PipelineLines -join "`n")
         }
-        elseif ($Response.message) {
-            Write-ErrorMessage "Ошибка API GigaChat: $($Response.message)"
+        elseif ($HasInstruction) {
+            $UserPrompt = $Instruction
+        }
+        elseif ($HasPipeline) {
+            $UserPrompt = $PipelineLines -join "`n"
         }
         else {
-            $Details = $Response | ConvertTo-Json -Compress -Depth 10
-            Write-ErrorMessage "Ошибка API GigaChat: неизвестный формат ответа. $Details"
+            $UserPrompt = ''
         }
 
-        return
+        # Интерактивный ввод — только если не переданы ни аргумент, ни Pipeline.
+        if (-not $HasInstruction -and -not $HasPipelineInput) {
+            if (-not [Console]::IsInputRedirected) {
+                Write-Output 'Введите запрос (Ctrl+Z, затем Enter для отправки):'
+            }
+
+            $UserPrompt = [Console]::In.ReadToEnd()
+        }
+
+        if ([string]::IsNullOrWhiteSpace($UserPrompt)) {
+            Write-ErrorMessage 'Ошибка: пустой запрос.'
+            return
+        }
+
+        # Системный промпт текущего запроса
+        if ($null -ne $s) {
+            $SystemContext = $s
+        }
+        else {
+            $SystemContext = $script:DefaultSystemPrompt
+        }
+
+        # Без -m начинаем новый диалог
+        if (-not $m) {
+            $script:GigaChatHistory.Clear()
+        }
+
+        # Получение токена
+        try {
+            $AccessToken = Get-AccessToken
+        }
+        catch {
+            Write-ErrorMessage "Ошибка: $($_.Exception.Message)"
+            return
+        }
+
+        # Сборка контекста
+        $Messages = [System.Collections.Generic.List[hashtable]]::new()
+
+        $Messages.Add(@{
+            role    = 'system'
+            content = $SystemContext
+        })
+
+        foreach ($Message in $script:GigaChatHistory) {
+            $Messages.Add($Message)
+        }
+
+        $Messages.Add(@{
+            role    = 'user'
+            content = $UserPrompt
+        })
+
+        $Payload = @{
+            model    = 'GigaChat-3-Ultra'
+            messages = $Messages
+            stream   = $false
+        }
+
+        # Запрос к API
+        try {
+            $Response = Invoke-RestMethod `
+                -Uri "$script:BaseUrl/v1/chat/completions" `
+                -Method Post `
+                -Headers @{
+                    Accept        = 'application/json'
+                    Authorization = "Bearer $AccessToken"
+                } `
+                -ContentType 'application/json; charset=utf-8' `
+                -Body ($Payload | ConvertTo-Json -Depth 10 -Compress)
+        }
+        catch {
+            Write-ErrorMessage "Ошибка: не удалось выполнить запрос к API GigaChat: $(Get-ResponseError $_)"
+            return
+        }
+
+        # Проверка ответа
+        $AIText = $null
+
+        if ($Response.choices -and $Response.choices[0] -and $null -ne $Response.choices[0].message.content) {
+            $AIText = $Response.choices[0].message.content
+        }
+
+        if ($null -eq $AIText) {
+            if ($Response.error) {
+                $ApiError = $Response.error.message
+
+                if (-not $ApiError) {
+                    $ApiError = $Response.error | ConvertTo-Json -Compress -Depth 10
+                }
+
+                Write-ErrorMessage "Ошибка API GigaChat: $ApiError"
+            }
+            elseif ($Response.message) {
+                Write-ErrorMessage "Ошибка API GigaChat: $($Response.message)"
+            }
+            else {
+                $Details = $Response | ConvertTo-Json -Compress -Depth 10
+                Write-ErrorMessage "Ошибка API GigaChat: неизвестный формат ответа. $Details"
+            }
+
+            return
+        }
+
+        # Вывод результата
+        [Console]::Out.WriteLine([string]$AIText)
+
+        # Сохранение только успешно завершённого обмена
+        $script:GigaChatHistory.Add(@{
+            role    = 'user'
+            content = $UserPrompt
+        })
+
+        $script:GigaChatHistory.Add(@{
+            role    = 'assistant'
+            content = $AIText
+        })
+
+        # Сохраняем не более N полных пар вопрос-ответ
+        Trim-GigaChatHistory
     }
-
-    # Вывод результата
-    [Console]::Out.WriteLine([string]$AIText)
-
-    # Сохранение только успешно завершённого обмена
-    $script:GigaChatHistory.Add(@{
-        role    = 'user'
-        content = $UserPrompt
-    })
-
-    $script:GigaChatHistory.Add(@{
-        role    = 'assistant'
-        content = $AIText
-    })
-
-    # Сохраняем не более N полных пар вопрос-ответ
-    Trim-GigaChatHistory
 }
 
 Export-ModuleMember -Function gpt

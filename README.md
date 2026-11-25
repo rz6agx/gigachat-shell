@@ -132,19 +132,23 @@ gpt "Объясни разницу между TCP и UDP"
 # Запрос с кастомным промптом
 gpt -s "Ты опытный Windows администратор. Отвечай кратко, предлагай конкретные команды." "Как найти процесс, занимающий порт 8080?"
 
-# Анализ файла: содержимое передаётся через stdin, чтобы не упираться в лимит длины командной строки
-Get-Content "$HOME\Documents\PowerShell\Modules\GigaChat\GigaChat.psm1" -Raw | gpt -s "Проанализируй код модуля на ошибки"
+# Анализ файла: содержимое передаётся через конвейер (pipeline),
+# чтобы не упираться в лимит длины командной строки
+Get-Content "$HOME\Documents\PowerShell\Modules\GigaChat\GigaChat.psm1" -Raw |
+    gpt "Проанализируй код модуля на ошибки"
+
+# Если хотите разделить роль и задачу
+Get-Content "$HOME\Documents\PowerShell\Modules\GigaChat\GigaChat.psm1" -Raw |
+    gpt -s "Ты опытный ревьюер PowerShell-кода" "Проанализируй модуль на ошибки"
 
 # Анализ файла с GitHub
-(Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/rz6agx/gigachat-shell/refs/heads/main/powershell/GigaChat.psm1') | gpt -s "Проанализируй код модуля на ошибки"
+Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/rz6agx/gigachat-shell/refs/heads/main/powershell/GigaChat.psm1' | gpt "Проанализируй код модуля на ошибки"
 
-# Начало диалога
+# Начало диалога (без -m история сбрасывается)
 gpt "Что делает Get-ChildItem?"
 
-# Включаем память
+# Продолжение диалога: -m сохраняет предыдущий контекст
 gpt -m "Как вывести только файлы?"
-
-# Второй и третий запросы учитывают предыдущий контекст
 gpt -m "А как отсортировать их по размеру?"
 ```
 
